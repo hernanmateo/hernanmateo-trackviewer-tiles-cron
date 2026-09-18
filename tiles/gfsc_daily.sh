@@ -168,7 +168,7 @@ else
 
   LIST="$W/products.tsv"
   set +e
-  python3 gfsc_query.py --date "$DATE" --bbox "$BBOX" --prefix "$NAME_PREFIX" > "$LIST"
+  python3 gfsc_query.py --date "$DATE" --bbox="$BBOX" --prefix "$NAME_PREFIX" > "$LIST"
   RC=$?
   set -e
   if [ $RC -eq 3 ]; then
