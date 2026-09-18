@@ -1,0 +1,90 @@
+# Capa diaria de nieve húmeda/seca (Copernicus WDS, Sentinel-1) → R2.
+# Recorre las mismas nueve cajas europeas, con prefijo wds_ (tiles/wds_europe.sh).
+#
+# DIFERENCIA IMPORTANTE CON GFSC: Sentinel-1 cubre por franjas de órbita, así
+# que un día cualquiera hay cajas SIN producto (salen con aviso, código 3, y
+# conservan el último día con datos en R2). Eso es normal y no es un fallo:
+# aquí la comprobación de "¿ya publicado?" no puede exigir la fecha de ayer.
+#
+# Se lanza más tarde que gfsc-daily para no solapar los dos jobs en el mismo
+# tramo horario. Duración medida en local (2026-09-18): ~17 min.
+#
+# Mismos secrets que gfsc-daily (CDSE_S3_*, R2_*).
+name: wds-daily
+
+on:
+  schedule:
+    - cron: "40 9 * * *"   # intento principal
+    - cron: "40 14 * * *"  # reintento: recoge las cajas que a las 09:40 no tenían producto
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Fecha del producto (YYYY-MM-DD); vacío = ayer UTC"
+        required: false
+        default: ""
+      regions:
+        description: "Cajas a procesar; vacío = todas (p. ej. 'wds_nordic wds_iceland')"
+        required: false
+        default: ""
+
+jobs:
+  wds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fecha objetivo
+        id: date
+        run: |
+          DATE="${{ inputs.date }}"
+          [ -z "$DATE" ] && DATE=$(date -u -d yesterday +%F)
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "Objetivo: productos WDS de $DATE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Liberar disco
+        run: |
+          # Igual que en gfsc-daily: ubuntu-latest solo garantiza ~14 GB.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Instalar GDAL, rclone y pmtiles
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y gdal-bin python3-gdal rclone jq
+          URL=$(curl -sL https://api.github.com/repos/protomaps/go-pmtiles/releases/latest \
+            | jq -r '.assets[].browser_download_url' | grep -i 'linux_x86_64.tar.gz$' | head -1)
+          curl -sL "$URL" | sudo tar -xz -C /usr/local/bin pmtiles
+          gdalinfo --version && pmtiles version || true
+
+      - name: Generar y subir las cajas europeas
+        env:
+          CDSE_S3_ACCESS_KEY: ${{ secrets.CDSE_S3_ACCESS_KEY }}
+          CDSE_S3_SECRET_KEY: ${{ secrets.CDSE_S3_SECRET_KEY }}
+          DATE: ${{ steps.date.outputs.date }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          set +e
+          ./tiles/wds_europe.sh 2>&1 | tee /tmp/wds.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '```'
+            sed -n '/== Resumen/,$p' /tmp/wds.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ $RC -ne 0 ]; then
+            echo "::error::Alguna caja WDS falló; ver el resumen."
+            exit $RC
+          fi
+          # Que varias cajas salgan con aviso es LO ESPERABLE con Sentinel-1;
+          # solo avisamos si no entró ninguna, que sugiere retraso en CDSE.
+          if grep -q "ok:    (ninguna)" /tmp/wds.log; then
+            echo "::warning::Ninguna caja WDS tenía producto de $DATE; se reintentará."
+          fi

@@ -1,0 +1,123 @@
+# Capa diaria de cobertura de nieve (Copernicus GFSC) → R2.
+# Recorre las NUEVE cajas europeas de tiles/gfsc_europe.sh.
+#
+# Dos crones: a las 07:20 UTC (el producto del día anterior suele estar ya en
+# CDSE) y un reintento a las 12:20 UTC que solo trabaja si el json del día
+# aún no está en R2 (si a las 07:20 CDSE iba con retraso, las cajas salieron
+# con código 3 —aviso, no fallo— sin subir nada).
+#
+# Duración medida en local (2026-09-18, todas las cajas): ~53 min. El runner
+# de GitHub es más lento que el Mac, de ahí el timeout holgado.
+#
+# Secrets necesarios (Settings → Secrets and variables → Actions):
+#   CDSE_S3_ACCESS_KEY / CDSE_S3_SECRET_KEY
+#       claves S3 de eodata, se generan en
+#       https://eodata-s3keysmanager.dataspace.copernicus.eu (cuenta CDSE gratuita)
+#   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#       token de API de R2 con permiso de escritura en el bucket trackviewer-tiles
+#   R2_ENDPOINT
+#       https://<account_id>.r2.cloudflarestorage.com
+name: gfsc-daily
+
+on:
+  schedule:
+    - cron: "20 7 * * *"   # intento principal
+    - cron: "20 12 * * *"  # reintento si el de las 07:20 no encontró producto
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Fecha del producto (YYYY-MM-DD); vacío = ayer UTC"
+        required: false
+        default: ""
+      regions:
+        description: "Cajas a procesar; vacío = todas (p. ej. 'gfsc_nordic gfsc_iceland')"
+        required: false
+        default: ""
+
+jobs:
+  gfsc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # Remote rclone "r2" definido por entorno, mismo nombre que en local
+      # (los scripts usan r2:trackviewer-tiles/...).
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fecha objetivo
+        id: date
+        run: |
+          DATE="${{ inputs.date }}"
+          [ -z "$DATE" ] && DATE=$(date -u -d yesterday +%F)
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "Objetivo: productos GFSC de $DATE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ¿Ya publicado?
+        id: check
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y rclone jq
+          # Caja de referencia: si su json ya trae la fecha objetivo, la pasada
+          # de hoy ya corrió. Una caja concreta puede quedarse atrás (sin
+          # producto ese día), pero esto solo decide si RELANZAR la tanda.
+          PUBLISHED=$(rclone cat r2:trackviewer-tiles/pmtiles/gfsc_pyralps.json 2>/dev/null | jq -r .date || true)
+          if [ "$PUBLISHED" = "${{ steps.date.outputs.date }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Ya estaba publicado (json en R2 con esa fecha); nada que hacer." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "En R2: '${PUBLISHED:-nada}' → hay que generar." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Liberar disco
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          # ubuntu-latest solo GARANTIZA ~14 GB libres y la caja nordic mueve
+          # varios GB de ráster intermedio. Borrar los toolchains que no
+          # usamos (Android SDK, .NET, GHC) libera >20 GB en menos de un minuto.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Instalar GDAL y pmtiles
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sudo apt-get -qq install -y gdal-bin python3-gdal
+          # CLI de PMTiles (go-pmtiles), binario de la release más reciente
+          URL=$(curl -sL https://api.github.com/repos/protomaps/go-pmtiles/releases/latest \
+            | jq -r '.assets[].browser_download_url' | grep -i 'linux_x86_64.tar.gz$' | head -1)
+          curl -sL "$URL" | sudo tar -xz -C /usr/local/bin pmtiles
+          gdalinfo --version && pmtiles version || true
+
+      - name: Generar y subir las cajas europeas
+        if: steps.check.outputs.skip == 'false'
+        env:
+          CDSE_S3_ACCESS_KEY: ${{ secrets.CDSE_S3_ACCESS_KEY }}
+          CDSE_S3_SECRET_KEY: ${{ secrets.CDSE_S3_SECRET_KEY }}
+          DATE: ${{ steps.date.outputs.date }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          # gfsc_europe.sh sigue con la siguiente caja si una falla y solo sale
+          # con error si alguna falló DE VERDAD; las que no tienen producto
+          # publicado ese día cuentan como aviso.
+          set +e
+          ./tiles/gfsc_europe.sh 2>&1 | tee /tmp/gfsc.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '```'
+            sed -n '/== Resumen/,$p' /tmp/gfsc.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ $RC -ne 0 ]; then
+            echo "::error::Alguna caja GFSC falló; ver el resumen."
+            exit $RC
+          fi
+          # Si TODAS salieron con aviso (nada publicado aún en CDSE), el cron
+          # de las 12:20 lo reintentará solo.
+          if grep -q "ok:    (ninguna)" /tmp/gfsc.log; then
+            echo "::warning::Ninguna caja tenía producto de $DATE; se reintentará."
+          fi

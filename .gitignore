@@ -1,0 +1,17 @@
+# Credenciales locales (CDSE, R2). En CI llegan de los secrets del runner.
+.env
+tiles/.env
+
+# Artefactos del pipeline: DEM, rásteres intermedios, mbtiles/pmtiles y logs.
+# Nada de esto se versiona: un DEM de 576 MB commiteado por error en el repo
+# del servidor es justamente lo que obligó a crear este repositorio aparte
+# (GitHub rechaza cualquier push con ficheros de más de 100 MB).
+tiles/work_*/
+tiles/out_*/
+tiles/dem_*/
+tiles/*.log
+tiles/*.tif
+tiles/*.mbtiles
+tiles/*.pmtiles
+
+.DS_Store
