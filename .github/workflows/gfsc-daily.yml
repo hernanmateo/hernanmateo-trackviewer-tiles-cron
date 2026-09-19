@@ -60,7 +60,15 @@ jobs:
       - name: ¿Ya publicado?
         id: check
         run: |
-          sudo apt-get -qq update && sudo apt-get -qq install -y rclone jq
+          sudo apt-get -qq update && sudo apt-get -qq install -y jq unzip
+          # rclone NO el del sistema: Ubuntu 24.04 trae la 1.60 (de 2022), que
+          # contra R2 falla al subir con "NotImplemented" (visto el 2026-09-19
+          # en wds-daily: subió los .pmtiles y ningún .json). Se baja la
+          # versión actual, la misma que funciona en local.
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          sudo unzip -qq -o -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/rclone && hash -r
+          rclone version | head -1
           # Caja de referencia: si su json ya trae la fecha objetivo, la pasada
           # de hoy ya corrió. Una caja concreta puede quedarse atrás (sin
           # producto ese día), pero esto solo decide si RELANZAR la tanda.

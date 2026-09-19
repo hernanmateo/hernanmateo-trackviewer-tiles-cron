@@ -57,11 +57,19 @@ jobs:
       - name: Instalar GDAL, rclone y pmtiles
         run: |
           sudo apt-get -qq update
-          sudo apt-get -qq install -y gdal-bin python3-gdal rclone jq
+          sudo apt-get -qq install -y gdal-bin python3-gdal jq unzip
+          # rclone NO el del sistema: Ubuntu 24.04 trae la 1.60 (de 2022), que
+          # contra R2 falla al subir con "NotImplemented". Pasó el 2026-09-19:
+          # los .pmtiles se publicaron pero NINGÚN .json de metadatos, así que
+          # la app se quedó con la fecha del día anterior. La versión actual
+          # (la misma que funciona en local) se baja suelta.
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          sudo unzip -qq -o -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/rclone && hash -r
           URL=$(curl -sL https://api.github.com/repos/protomaps/go-pmtiles/releases/latest \
             | jq -r '.assets[].browser_download_url' | grep -i 'linux_x86_64.tar.gz$' | head -1)
           curl -sL "$URL" | sudo tar -xz -C /usr/local/bin pmtiles
-          gdalinfo --version && pmtiles version || true
+          rclone version | head -1 && pmtiles version || true
 
       - name: Generar y subir las cajas europeas
         env:
