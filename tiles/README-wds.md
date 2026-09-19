@@ -87,6 +87,48 @@ el 2026-09-16 → 2026-09-17 las cajas dieron 44→10 (pyralps), 54→0 (medit),
   se mosaican y el dato válido prevalece sobre las máscaras (la limpieza
   convierte las máscaras en nodata ANTES del warp, igual que en GFSC).
 
+## Composición temporal: el PMTiles es un compuesto de pasadas
+
+Regenerar el PMTiles desde cero cada día hacía **parpadear** la capa: medido
+el 2026-09-19, el archivo del 17 tenía datos sobre los Alpes y el del 18 los
+dejó en nodata (100 % de 255 en los tiles de Mont Blanc y los Alpes
+orientales) pese a que ese día había 71 productos — estaban en otra franja de
+órbita. Por eso `gfsc_daily.sh` con `PRODUCT=wds` **compone cada pasada sobre
+la anterior** (`wds_compose.py`; GFSC no lo necesita: es "gap-filled" de
+origen y su camino queda intacto):
+
+- Junto al PMTiles vive un **estado compuesto** por caja en R2
+  (`state/wds_<caja>.tif`, fuera del prefijo `pmtiles/` que sirve el Worker):
+  GeoTIFF de 2 bandas — valor SSC y **edad en días por píxel** — con la fecha
+  de la pasada en sus metadatos (`COMPOSITE_DATE`). La malla es exactamente
+  la del mosaico (mismo `-te`/`-tr`), así que componer es un alineado 1:1 sin
+  remuestrear: cada píxel del compuesto es copia literal del nuevo o del
+  previo, nunca un promedio (dato categórico).
+- Regla: el mosaico nuevo manda donde tiene dato (110/115/120, edad 0); donde
+  es 255 se conserva el valor anterior envejecido; a los **`MAX_AGE_DAYS`
+  días (7 por defecto) el píxel caduca** y vuelve a nodata. 7 = un ciclo
+  orbital completo de S1 (repetición nominal de 6 días): en condiciones
+  normales cada píxel se renueva antes de caducar; y el estado húmedo/seco es
+  meteorológico — más de una semana ya no describe la nieve de hoy.
+  Compromiso elegido: edad POR PÍXEL en una banda Byte (una fecha global no
+  permite caducar lo viejo sin tirar lo recién observado) y un único fichero
+  de estado autocontenido (más simple que guardar N mosaicos diarios y
+  recomponer, a cambio de que el estado es mutable: `COMPOSITE=0` lo ignora y
+  regenera la caja de cero si hiciera falta).
+- El `meta.json` no miente: `date` es la pasada más reciente, `oldestDate` la
+  fecha del píxel más viejo aún presente, `maxAgeDays` la caducidad, y
+  `composite: true` lo marca. La subida sigue siendo atómica: pmtiles →
+  estado → json (marca de commit).
+- Sin estado previo (primera pasada, caja nueva) la pasada se comporta como
+  siempre. Un estado con malla distinta o fecha posterior a la pasada se
+  ignora con aviso (relanzar una fecha vieja no pisa dato más nuevo);
+  relanzar la misma fecha (el reintento del cron) es idempotente. Ojo: los
+  días SIN producto (código 3) no publican nada, así que la caducidad solo se
+  aplica en la siguiente pasada con datos — el `meta.json` servido dice
+  siempre de cuándo es lo que se ve.
+- Con `UPLOAD=0` se guardan además `*.dry.state.tif` y `*.dry.new.tif` (el
+  mosaico del día sin componer) para poder auditar la regla píxel a píxel.
+
 ## Limitación conocida: el radar se degrada justo en terreno escarpado
 
 La detección de nieve húmeda viene del SAR de Sentinel-1, y en terreno

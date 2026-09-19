@@ -9,12 +9,21 @@
 #                           README-wds.md). Solo hay producto en las teselas
 #                           con pasada de Sentinel-1 ese día, así que la
 #                           cobertura diaria es parcial (franjas de órbita).
+#                           Por eso WDS además COMPONE cada pasada sobre la
+#                           anterior (bloque COMPOSICIÓN de abajo y
+#                           wds_compose.py): reemplazar el archivo entero
+#                           cada día hacía parpadear la capa — donde ayer
+#                           había dato, hoy hueco. GFSC no lo necesita: es
+#                           "gap-filled" de origen y cada archivo diario ya
+#                           es completo.
 #
 #   DATE=2026-09-16 ./gfsc_daily.sh          # fecha concreta
 #   ./gfsc_daily.sh                          # por defecto: ayer UTC
 #   PRODUCT=wds DATASET=wds_pyralps ./gfsc_daily.sh
 #   DRY_RUN=1 DRY_SRC=test.tif ./gfsc_daily.sh   # valida la cadena GDAL→PMTiles
 #                                                # sin CDSE y sin subir a R2
+#   COMPOSITE=0 / MAX_AGE_DAYS=7 / PREV_STATE=<tif>: mandos de la composición
+#   de WDS, ver el bloque COMPOSICIÓN más abajo.
 #
 # Cadena: OData (búsqueda pública) → descarga por S3 de CDSE de SOLO el
 # GeoTIFF de la banda (rclone) → limpieza de códigos → warp a EPSG:3857
@@ -93,6 +102,9 @@ case "$PRODUCT" in
     # categóricas, donde un valor inventado es una clase que no existe.
     LEGAL_VALUES=""
     DEFAULT_DATASET="gfsc_pyralps"
+    # Sin composición: el producto ya es "gap-filled" (cada archivo diario
+    # trae la mejor estimación completa de la caja), reemplazar es correcto.
+    DEFAULT_COMPOSITE=0
     ;;
   wds)
     COLLECTION="clms_wsi_wet-dry-snow_europe_utm_60m_daily_v2"
@@ -110,6 +122,10 @@ case "$PRODUCT" in
     CLEAN_CALC="(A==110)*110 + (A==115)*115 + (A==120)*120 + ((A!=110)&(A!=115)&(A!=120))*255"
     LEGAL_VALUES="110,115,120,255"
     DEFAULT_DATASET="wds_pyralps"
+    # Composición temporal: la cobertura diaria de S1 son franjas de órbita,
+    # así que el mosaico del día se funde con el estado anterior en vez de
+    # reemplazarlo (ver bloque COMPOSICIÓN y wds_compose.py).
+    DEFAULT_COMPOSITE=1
     ;;
   *)
     echo "PRODUCT desconocido: $PRODUCT (esperaba gfsc o wds)" >&2
@@ -117,6 +133,22 @@ case "$PRODUCT" in
     ;;
 esac
 TAG=$(printf '%s' "$PRODUCT" | tr '[:lower:]' '[:upper:]')
+
+# ------------------------------------------------------ composición (WDS)
+# COMPOSITE=0 fuerza el comportamiento antiguo (reemplazo seco) también en
+# WDS, p. ej. para regenerar una caja desde cero a propósito.
+COMPOSITE="${COMPOSITE:-$DEFAULT_COMPOSITE}"
+# Caducidad del dato arrastrado, en días. 7 = un ciclo orbital completo de
+# Sentinel-1 (repetición nominal de 6 días por satélite): en condiciones
+# normales cada píxel se renueva antes de caducar y la capa no parpadea; y el
+# estado húmedo/seco de la nieve es meteorológico — un dato de más de una
+# semana ya no describe la nieve de hoy y es mejor hueco honesto que dato
+# rancio. El meta.json publica oldestDate para que la app no mienta.
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-7}"
+# El estado compuesto (GeoTIFF de 2 bandas valor+edad, ver wds_compose.py)
+# vive en R2 FUERA del prefijo pmtiles/ que sirve el Worker: es interno del
+# pipeline, no un artefacto publicado.
+STATE_REMOTE="${STATE_REMOTE:-r2:trackviewer-tiles/state}"
 
 DATASET="${DATASET:-$DEFAULT_DATASET}"
 # bounds de la región pyr_alps de la app ([-2,42,17,48]) con medio grado de
@@ -239,6 +271,68 @@ gdalwarp -q -t_srs EPSG:3857 -tr $RES $RES -te $TE \
   -co COMPRESS=DEFLATE -co TILED=YES \
   "$W"/clean/*.tif "$MOSAIC"
 
+# ---------------------------------------------------------------- composición
+# Solo WDS (ver cabecera): el mosaico del día se funde con el estado compuesto
+# de la pasada anterior — el nuevo manda donde tiene dato, donde es nodata se
+# conserva el valor previo hasta que caduca a los MAX_AGE_DAYS días. Toda la
+# lógica (regla píxel a píxel, edad por píxel, mallas, fechas) está en
+# wds_compose.py; aquí solo se mueve el estado desde/hacia R2. Sin estado
+# previo (primera pasada o caja nueva) el resultado es el mosaico del día tal
+# cual, o sea, el comportamiento de siempre. OLDEST_DATE acaba en el
+# meta.json: la fecha del píxel más viejo aún presente en el compuesto.
+OLDEST_DATE="$DATE"
+if [ "$COMPOSITE" = "1" ]; then
+  # Las teselas crudas y limpias ya están mosaicadas: fuera antes de traer el
+  # estado, que el disco del runner de CI va justo (~14 GB garantizados).
+  rm -rf "$W/raw" "$W/clean"
+  STATE_PREV="$W/state_prev.tif"
+  STATE_NEW="$W/${DATASET}_state.tif"
+  HAVE_PREV=0
+  if [ -n "${PREV_STATE:-}" ]; then
+    # Estado previo local explícito (pruebas, bootstrap, backfill): sustituye
+    # a la descarga de R2.
+    cp "$PREV_STATE" "$STATE_PREV"
+    HAVE_PREV=1
+  elif [ "$DRY_RUN" != "1" ]; then
+    # OJO: copyto de un objeto S3 inexistente puede salir con rc 0 SIN crear
+    # el fichero (cae en semántica de directorio vacío; medido aquí el
+    # 2026-09-19 contra R2), o con rc 3/4 según la versión — todos esos casos
+    # son la primera pasada legítima y se detectan porque el fichero no está.
+    # Cualquier otro fallo ABORTA: publicar un día suelto por un error
+    # transitorio de R2 tiraría el histórico compuesto.
+    set +e
+    rclone copyto "$STATE_REMOTE/$DATASET.tif" "$STATE_PREV"
+    RC=$?
+    set -e
+    if [ -s "$STATE_PREV" ]; then
+      HAVE_PREV=1
+    elif [ $RC -eq 0 ] || [ $RC -eq 3 ] || [ $RC -eq 4 ]; then
+      echo ">> [$TAG $DATE] sin estado previo en $STATE_REMOTE/$DATASET.tif (primera pasada): sin composición"
+    else
+      echo "$TAG $DATE: error bajando el estado previo de R2 (rc=$RC)" >&2
+      exit 1
+    fi
+  fi
+  PREV_ARG=""
+  [ "$HAVE_PREV" = "1" ] && PREV_ARG="--prev $STATE_PREV"
+  echo ">> [$TAG $DATE] composición sobre el estado previo (caducidad ${MAX_AGE_DAYS}d)"
+  # shellcheck disable=SC2086
+  COMPOSE_STATS=$(python3 wds_compose.py --new "$MOSAIC" $PREV_ARG \
+    --date "$DATE" --max-age-days "$MAX_AGE_DAYS" --out "$STATE_NEW")
+  # El JSON completo de recuentos queda en el log (auditoría del compuesto).
+  printf '   %s\n' "$COMPOSE_STATS"
+  OLDEST_DATE=$(printf '%s' "$COMPOSE_STATS" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['oldest_date'])")
+  rm -f "$STATE_PREV"
+  # De aquí en adelante la cadena PMTiles trabaja sobre el COMPUESTO (banda 1
+  # del estado), no sobre el mosaico del día; RAW_MOSAIC se guarda solo para
+  # poder inspeccionarlo con UPLOAD=0.
+  RAW_MOSAIC="$MOSAIC"
+  MOSAIC="$W/${DATASET}_composite.tif"
+  gdal_translate -q -b 1 -a_nodata 255 \
+    -co COMPRESS=DEFLATE -co TILED=YES "$STATE_NEW" "$MOSAIC"
+fi
+
 # ---------------------------------------------------------------- PMTiles
 echo ">> [$TAG $DATE] MBTiles (NEAREST, ver cabecera) + overviews hasta z$MINZOOM"
 gdal_translate -q -of MBTILES "$MOSAIC" "$MB" \
@@ -272,10 +366,13 @@ pmtiles convert "$MB" "$PM"
 pmtiles show "$PM" | grep -iE "min zoom|max zoom|tile contents count" || true
 
 # Metadatos para la app: fecha del dato ("nieve a <fecha>"), instante de
-# generación (detectar datos rancios) y cobertura.
+# generación (detectar datos rancios) y cobertura. En las capas compuestas
+# (WDS) se añade desde cuándo se arrastra dato, porque la app rotula la fecha
+# en la leyenda y no debe mentir: date = la pasada más reciente, oldestDate =
+# el píxel más viejo aún presente, maxAgeDays = la caducidad aplicada.
 python3 - "$META" <<EOF
 import json, sys, datetime
-json.dump({
+meta = {
     "dataset": "$DATASET",
     "date": "$DATE",
     "generated": datetime.datetime.now(datetime.timezone.utc)
@@ -288,7 +385,12 @@ json.dump({
     },
     "source": "$COLLECTION",
     "attribution": "© Copernicus Land Monitoring Service / EEA",
-}, open(sys.argv[1], "w"), indent=1)
+}
+if "$COMPOSITE" == "1":
+    meta["composite"] = True
+    meta["oldestDate"] = "$OLDEST_DATE"
+    meta["maxAgeDays"] = int("$MAX_AGE_DAYS")
+json.dump(meta, open(sys.argv[1], "w"), indent=1)
 EOF
 
 # ---------------------------------------------------------------- subida
@@ -300,6 +402,13 @@ if [ "$DRY_RUN" = "1" ] || [ "${UPLOAD:-1}" = "0" ]; then
   cp "$PM" "$OUT_DIR/$DATASET.dry.pmtiles"
   cp "$META" "$OUT_DIR/$DATASET.dry.json"
   echo ">> sin subida. Resultado en $OUT_DIR/$DATASET.dry.{pmtiles,json}"
+  if [ "$COMPOSITE" = "1" ]; then
+    # Para inspección: el estado compuesto y el mosaico del día SIN componer
+    # (permite verificar la regla de composición píxel a píxel).
+    cp "$STATE_NEW" "$OUT_DIR/$DATASET.dry.state.tif"
+    cp "$RAW_MOSAIC" "$OUT_DIR/$DATASET.dry.new.tif"
+    echo ">>            y en $OUT_DIR/$DATASET.dry.{state,new}.tif"
+  fi
 else
   echo ">> [$TAG $DATE] subida a R2 (pmtiles primero, json como marca de commit)"
   # Cache-Control corto: el objeto se reemplaza a diario. --s3-no-check-bucket:
@@ -307,6 +416,13 @@ else
   rclone copyto --s3-no-check-bucket \
     --header-upload "Cache-Control: public, max-age=21600" \
     "$PM" "r2:trackviewer-tiles/pmtiles/$DATASET.pmtiles"
+  if [ "$COMPOSITE" = "1" ]; then
+    # El estado va DESPUÉS del pmtiles y ANTES del json (la marca de commit):
+    # si el run muere a medias, la próxima pasada compone sobre un estado que
+    # nunca es más nuevo que el pmtiles servido, y todo se re-sube entero.
+    rclone copyto --s3-no-check-bucket \
+      "$STATE_NEW" "$STATE_REMOTE/$DATASET.tif"
+  fi
   rclone copyto --s3-no-check-bucket \
     --header-upload "Cache-Control: public, max-age=300" \
     "$META" "r2:trackviewer-tiles/pmtiles/$DATASET.json"
